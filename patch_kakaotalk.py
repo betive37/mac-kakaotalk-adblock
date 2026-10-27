@@ -283,10 +283,6 @@ def _validate_layout(data: bytes | bytearray, target: TargetSpec) -> None:
             raise PatchError(f'Signature must end at the current slice boundary in slice {index}')
         if signature_offset + slice_spec.signature_size != slice_spec.size:
             raise PatchError(f'Unexpected original signature reservation in slice {index}')
-        signature_end = offset + signature_offset + signature_size
-        original_end = offset + slice_spec.size
-        if any(data[signature_end:original_end]):
-            raise PatchError(f'Nonzero padding after shortened signature in slice {index}')
         linkedit_offset, linkedit_size = linkedit
         if linkedit_offset + linkedit_size != size:
             raise PatchError(f'LINKEDIT size is inconsistent with signature size in slice {index}')

@@ -183,6 +183,20 @@ class TargetValidationTests(TargetFixture, unittest.TestCase):
         self.write(self.signed_patch())
         self.assertEqual(inspect_app(self.app, self.spec), AppState.PATCHED)
 
+    def test_residual_signature_bytes_are_allowed_only_inside_original_reservation(self):
+        data = self.signed_patch()
+        first = self.spec.slices[0]
+        current_size = struct.unpack_from('>I', data, 20)[0]
+        original_end = first.offset + first.size
+        data[first.offset + current_size:original_end] = self.original[first.offset + current_size:original_end]
+        self.write(data)
+        self.assertEqual(inspect_app(self.app, self.spec), AppState.PATCHED)
+
+        data[original_end] = 0x5A
+        self.write(data)
+        with self.assertRaises(PatchError):
+            inspect_app(self.app, self.spec)
+
     def test_wrong_identity_version_or_build_is_rejected(self):
         for field in ('CFBundleIdentifier', 'CFBundleShortVersionString', 'CFBundleVersion'):
             with self.subTest(field=field):
@@ -233,7 +247,6 @@ class TargetValidationTests(TargetFixture, unittest.TestCase):
             'non-signature code': (0x1113896 + 0x20, 1, 0x5A),
             'load command': (find_load_command(self.original, self.spec.slices[0], 0x1D) + 20, 1, 0x5A),
             'LINKEDIT': (self.spec.slices[0].offset + self.spec.slices[0].signature_offset - 32, 1, 0x5A),
-            'signature padding': (self.spec.slices[0].offset + self.spec.slices[0].size - 1, 1, 0x5A),
         }
         for name, (offset, length, value) in mutations.items():
             with self.subTest(name=name):
