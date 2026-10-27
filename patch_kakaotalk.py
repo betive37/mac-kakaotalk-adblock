@@ -240,19 +240,29 @@ def _validate_layout(data: bytes | bytearray, target: TargetSpec) -> None:
     if len(data) != expected_length:
         raise PatchError(f'Executable size does not match current fat slices: expected {expected_length}, found {len(data)}')
 
+    previous_end = 8 + count * 20
+    previous_reservation_end = previous_end
     for index, slice_spec in enumerate(target.slices):
         cpu, _, offset, size, alignment = architectures[index]
-        if (cpu, offset, alignment) != (slice_spec.cpu, slice_spec.offset, slice_spec.alignment):
-            raise PatchError(f'Unexpected architecture or layout for slice {index}')
+        if cpu != slice_spec.cpu:
+            raise PatchError(f'Unexpected architecture for slice {index}: {cpu:#x}')
+        if alignment > 31 or offset % (1 << alignment):
+            raise PatchError(f'Invalid alignment for slice {index}: offset={offset:#x}, alignment={alignment}')
+        if offset < previous_end:
+            raise PatchError(f'Overlapping header or slices at slice {index}')
         if size > slice_spec.size or size < 32:
             raise PatchError(f'Unexpected slice size for slice {index}: {size:#x}')
         _range(data, offset, size, len(data), f'current slice {index}')
+        if any(memoryview(data)[min(previous_reservation_end, offset):offset]):
+            raise PatchError(f'Unexpected data outside signature reservation before slice {index}')
+        previous_end = offset + size
+        previous_reservation_end = offset + slice_spec.size
         if _unpack('<I', data, offset, offset + size, 'Mach-O header')[0] != _MH_MAGIC_64:
             raise PatchError(f'Expected 64-bit Mach-O header in slice {index}')
         command_count, commands_size = _unpack('<II', data, offset + 16, offset + size, 'Mach-O command counts')
         commands_start = offset + 32
         commands_end = commands_start + commands_size
-        _range(data, commands_start, commands_size, offset + size, f'load commands for slice {index}')
+        _range(data, commands_start, commands_size, offset + min(size, slice_spec.signature_offset), f'load commands for slice {index}')
         if command_count > commands_size // 8:
             raise PatchError(f'Invalid load-command count in slice {index}')
         position = commands_start
@@ -288,25 +298,39 @@ def _validate_layout(data: bytes | bytearray, target: TargetSpec) -> None:
             raise PatchError(f'LINKEDIT size is inconsistent with signature size in slice {index}')
 
 
-def _normalized_sha256(original_code: bytes, target: TargetSpec) -> str:
-    data = bytearray(original_code)
-    signature_ranges = []
+def _normalized_sha256(original_code: bytes | bytearray, target: TargetSpec) -> str:
+    # Hash the validated slices in the original layout, excluding their signatures.
+    # Physical offsets/alignment may change when codesign repacks a universal binary.
+    header_size = 8 + len(target.slices) * 20
+    header = bytearray(original_code[:header_size])
     for index, slice_spec in enumerate(target.slices):
-        struct.pack_into('>I', data, 8 + index * 20 + 12, 0)
-        position = slice_spec.offset + 32
-        command_count, _ = struct.unpack_from('<II', original_code, slice_spec.offset + 16)
+        struct.pack_into('>III', header, 16 + index * 20, slice_spec.offset, 0, slice_spec.alignment)
+    digest = hashlib.sha256(header)
+    previous_original_end = header_size
+    for index, slice_spec in enumerate(target.slices):
+        offset = struct.unpack_from('>I', original_code, 16 + index * 20)[0]
+        data = bytearray(memoryview(original_code)[offset:offset + slice_spec.signature_offset])
+        position = 32
+        command_count = struct.unpack_from('<I', data, 16)[0]
         for _ in range(command_count):
-            command, command_size = struct.unpack_from('<II', original_code, position)
+            command, command_size = struct.unpack_from('<II', data, position)
             if command == _LC_CODE_SIGNATURE:
                 data[position + 8:position + 16] = b'\0' * 8
-            elif command == _LC_SEGMENT_64 and original_code[position + 8:position + 24].rstrip(b'\0') == b'__LINKEDIT':
+            elif command == _LC_SEGMENT_64 and data[position + 8:position + 24].rstrip(b'\0') == b'__LINKEDIT':
                 data[position + 48:position + 56] = b'\0' * 8
             position += command_size
-        start = slice_spec.offset + slice_spec.signature_offset
-        signature_ranges.append((start, slice_spec.offset + slice_spec.size))
-    for start, end in sorted(signature_ranges, reverse=True):
-        del data[start:end]
-    return hashlib.sha256(data).hexdigest()
+        digest.update(b'\0' * (slice_spec.offset - previous_original_end))
+        digest.update(data)
+        previous_original_end = slice_spec.offset + slice_spec.size
+    return digest.hexdigest()
+
+
+def _patch_file_offset(data: bytes, patch: PatchSpec, target: TargetSpec) -> int:
+    for index, slice_spec in enumerate(target.slices):
+        if slice_spec.offset <= patch.file_offset and patch.file_offset + len(patch.original) <= slice_spec.offset + slice_spec.signature_offset:
+            offset = struct.unpack_from('>I', data, 16 + index * 20)[0]
+            return offset + patch.file_offset - slice_spec.offset
+    raise PatchError(f'Patch site is outside the supported code slices: {patch.architecture}')
 
 
 def _read_executable(app: Path, target: TargetSpec) -> tuple[Path, bytes]:
@@ -325,12 +349,13 @@ def inspect_app(app: Path, target: TargetSpec = TARGET) -> AppState:
         if any(data[p.file_offset:p.file_offset + len(p.original)] != p.original for p in target.patches):
             raise PatchError('Original digest and patch-site bytes disagree')
         return AppState.ORIGINAL
-    if any(data[p.file_offset:p.file_offset + len(p.replacement)] != p.replacement for p in target.patches):
-        raise PatchError('Executable is neither the supported original nor a complete approved patch')
     restored = bytearray(data)
     for patch in target.patches:
-        restored[patch.file_offset:patch.file_offset + len(patch.original)] = patch.original
-    if _normalized_sha256(bytes(restored), target) != target.normalized_original_sha256:
+        offset = _patch_file_offset(data, patch, target)
+        if data[offset:offset + len(patch.replacement)] != patch.replacement:
+            raise PatchError('Executable is neither the supported original nor a complete approved patch')
+        restored[offset:offset + len(patch.original)] = patch.original
+    if _normalized_sha256(restored, target) != target.normalized_original_sha256:
         raise PatchError('Patched executable differs outside the approved signature metadata')
     return AppState.PATCHED
 

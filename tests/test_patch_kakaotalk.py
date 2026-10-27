@@ -177,6 +177,26 @@ class TargetFixture:
         del data[sum(current_end):]
         return data
 
+    @classmethod
+    def repacked_signed_patch(cls):
+        data = cls.signed_patch()
+        first = cls.spec.slices[0]
+        signature = find_load_command(data, first, 0x1D)
+        linkedit = find_load_command(data, first, 0x19, b'__LINKEDIT')
+        new_size = first.signature_offset + 256
+        struct.pack_into('<I', data, signature + 12, 256)
+        linkedit_start = struct.unpack_from('<Q', data, linkedit + 40)[0]
+        struct.pack_into('<Q', data, linkedit + 48, new_size - linkedit_start)
+        struct.pack_into('>I', data, 20, new_size)
+        result = bytearray(data[:48])
+        for index, alignment in enumerate((14, 15)):
+            old_offset, size = struct.unpack_from('>II', data, 16 + index * 20)
+            offset = (len(result) + (1 << alignment) - 1) & -(1 << alignment)
+            result.extend(b'\0' * (offset - len(result)))
+            result.extend(data[old_offset:old_offset + size])
+            struct.pack_into('>III', result, 16 + index * 20, offset, size, alignment)
+        return result
+
 class TargetValidationTests(TargetFixture, unittest.TestCase):
     def test_original_and_signed_patched_fixtures_are_distinguished(self):
         self.assertEqual(inspect_app(self.app, self.spec), AppState.ORIGINAL)
@@ -196,6 +216,33 @@ class TargetValidationTests(TargetFixture, unittest.TestCase):
         self.write(data)
         with self.assertRaises(PatchError):
             inspect_app(self.app, self.spec)
+
+    def test_repacked_signed_slices_preserve_patch_state(self):
+        data = self.repacked_signed_patch()
+        self.write(data)
+        self.assertEqual(inspect_app(self.app, self.spec), AppState.PATCHED)
+        with self.assertRaises(PatchError):
+            patched_executable(bytes(data), self.spec)
+
+    def test_repacked_slices_still_reject_code_and_architecture_changes(self):
+        signed = self.repacked_signed_patch()
+        arm_offset = struct.unpack_from('>I', signed, 36)[0]
+        patch_offset = arm_offset + self.spec.patches[1].file_offset - self.spec.slices[1].offset
+        mutations = {
+            'missing ARM patch': (patch_offset, self.spec.patches[1].original),
+            'ARM code outside patch': (patch_offset + 0x20, b'\x5A'),
+            'ARM CPU type': (28, struct.pack('>I', CPU_X86_64)),
+            'ARM CPU subtype': (32, struct.pack('>I', 99)),
+            'impossible alignment': (44, struct.pack('>I', 32)),
+            'overlapping slices': (36, struct.pack('>I', self.spec.slices[0].offset)),
+        }
+        for name, (offset, value) in mutations.items():
+            with self.subTest(name=name):
+                data = bytearray(signed)
+                data[offset:offset + len(value)] = value
+                self.write(data)
+                with self.assertRaises(PatchError):
+                    inspect_app(self.app, self.spec)
 
     def test_wrong_identity_version_or_build_is_rejected(self):
         for field in ('CFBundleIdentifier', 'CFBundleShortVersionString', 'CFBundleVersion'):
@@ -958,12 +1005,12 @@ class RealSigningTests(unittest.TestCase):
         self.assertTrue(self.nested_signatures)
         self.assertEqual({path: self.after[path]['sha256'] for path in self.nested_signatures}, self.nested_signatures)
 
-    def test_real_signed_slices_normalize_to_original_and_retain_architectures(self):
-        data = bytearray(self.binary.read_bytes())
-        for patch in TARGET.patches:
-            self.assertEqual(data[patch.file_offset:patch.file_offset + len(patch.replacement)], patch.replacement)
-            data[patch.file_offset:patch.file_offset + len(patch.original)] = patch.original
-        self.assertEqual(normalize_fixture(data, TARGET), TARGET.normalized_original_sha256)
+    def test_real_signed_slices_retain_patch_sites_and_architectures(self):
+        data = self.binary.read_bytes()
+        for index, (slice_spec, patch) in enumerate(zip(TARGET.slices, TARGET.patches)):
+            slice_offset = struct.unpack_from('>I', data, 16 + index * 20)[0]
+            offset = slice_offset + patch.file_offset - slice_spec.offset
+            self.assertEqual(data[offset:offset + len(patch.replacement)], patch.replacement)
         architectures = subprocess.run(
             ['/usr/bin/lipo', '-info', str(self.binary)], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, check=False,
