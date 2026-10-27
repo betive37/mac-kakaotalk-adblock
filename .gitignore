@@ -1,0 +1,30 @@
+# Default deny: keep proprietary apps, backups, manifests, and local records private.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/install.sh
+!/patch_kakaotalk.py
+!/distribution_entry.py
+!/tools/
+!/tests/
+
+/tools/*
+!/tools/build_installer.py
+
+/tests/*
+!/tests/__init__.py
+!/tests/test_patch_kakaotalk.py
+!/tests/test_distribution.py
+!/tests/test_installer.py
+!/tests/test_curl_installer.py
+
+# Never include proprietary binaries or runtime artifacts beneath allowed directories.
+*.app/
+*.dylib
+*.so
+*.pyc
+__pycache__/
+.DS_Store
+manifest.json
+.adblock-backups/
