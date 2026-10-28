@@ -45,6 +45,7 @@ class DistributionFixture(LifecycleFixture):
                 if command == 0x1D:
                     signed[position + 8:position + 16] = recorded[position + 8:position + 16]
                 elif command == 0x19 and self.original[position + 8:position + 24].rstrip(b'\0') == b'__LINKEDIT':
+                    signed[position + 32:position + 40] = recorded[position + 32:position + 40]
                     signed[position + 48:position + 56] = recorded[position + 48:position + 56]
                 position += command_size
             start, end = slice_spec.offset + slice_spec.signature_offset, slice_spec.offset + slice_spec.size

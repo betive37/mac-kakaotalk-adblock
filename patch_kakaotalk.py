@@ -65,7 +65,7 @@ TARGET = TargetSpec(
     version='26.9.0',
     build='2006',
     original_sha256='456e1a3ed7a87168888bdb8c6e4894764a028e62c0af68562a760d9909d2bb65',
-    normalized_original_sha256='4f76485c52cf22de8cfc44960ad7c4f1d3c57a2df33b34d8adf24678c8c69d01',
+    normalized_original_sha256='6e6f8156c33a439dd270a6d7e2421330d74ef69eeda56a3b6bbbf02913baf69a',
     slices=(
         SliceSpec(0x01000007, 0x4000, 0x287E1A0, 14, 0x2828E30, 0x55370),
         SliceSpec(0x0100000C, 0x2884000, 0x241EBC0, 14, 0x2407D30, 0x16E90),
@@ -317,6 +317,8 @@ def _normalized_sha256(original_code: bytes | bytearray, target: TargetSpec) -> 
             if command == _LC_CODE_SIGNATURE:
                 data[position + 8:position + 16] = b'\0' * 8
             elif command == _LC_SEGMENT_64 and data[position + 8:position + 24].rstrip(b'\0') == b'__LINKEDIT':
+                # codesign may shrink both the mapping and file sizes (macOS 27.2).
+                data[position + 32:position + 40] = b'\0' * 8
                 data[position + 48:position + 56] = b'\0' * 8
             position += command_size
         digest.update(b'\0' * (slice_spec.offset - previous_original_end))

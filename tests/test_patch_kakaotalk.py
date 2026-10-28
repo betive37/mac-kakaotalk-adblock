@@ -86,6 +86,7 @@ def normalize_fixture(data, spec):
         for _ in range(count):
             command, size = struct.unpack_from('<II', data, position)
             if command == 0x19 and data[position + 8:position + 24].rstrip(b'\0') == b'__LINKEDIT':
+                result[position + 32:position + 40] = b'\0' * 8
                 result[position + 48:position + 56] = b'\0' * 8
             elif command == 0x1D:
                 result[position + 8:position + 16] = b'\0' * 8
@@ -197,7 +198,58 @@ class TargetFixture:
             struct.pack_into('>III', result, 16 + index * 20, offset, size, alignment)
         return result
 
+    @classmethod
+    def resized_linkedit_signed_patch(cls, *, repack=False):
+        # Model smaller signatures and LINKEDIT mappings on macOS 27.2.
+        data = cls.pure_patch()
+        for index, slice_spec in enumerate(cls.spec.slices):
+            signature = find_load_command(data, slice_spec, 0x1D)
+            linkedit = find_load_command(data, slice_spec, 0x19, b'__LINKEDIT')
+            reduction = 0x4710
+            struct.pack_into('<I', data, signature + 12, slice_spec.signature_size - reduction)
+            for field, amount in ((32, 0x4000), (48, reduction)):
+                value = struct.unpack_from('<Q', data, linkedit + field)[0]
+                struct.pack_into('<Q', data, linkedit + field, value - amount)
+            struct.pack_into('>I', data, 20 + index * 20, slice_spec.size - reduction)
+        result = bytearray(data[:48])
+        for index, slice_spec in enumerate(cls.spec.slices):
+            size = struct.unpack_from('>I', data, 20 + index * 20)[0]
+            alignment = 1 << slice_spec.alignment
+            offset = (len(result) + alignment - 1) & -alignment if repack else slice_spec.offset
+            result.extend(b'\0' * (offset - len(result)))
+            result.extend(data[slice_spec.offset:slice_spec.offset + size])
+            struct.pack_into('>I', result, 16 + index * 20, offset)
+        return result
+
 class TargetValidationTests(TargetFixture, unittest.TestCase):
+    def test_resized_linkedit_mapping_preserves_patch_state(self):
+        for repack in (False, True):
+            with self.subTest(repack=repack):
+                self.write(self.resized_linkedit_signed_patch(repack=repack))
+                self.assertEqual(inspect_app(self.app, self.spec), AppState.PATCHED)
+
+    def test_resized_linkedit_mapping_still_rejects_unapproved_changes(self):
+        signed = self.resized_linkedit_signed_patch(repack=True)
+        for index, slice_spec in enumerate(self.spec.slices):
+            offset = struct.unpack_from('>I', signed, 16 + index * 20)[0]
+            current_slice = dataclasses.replace(slice_spec, offset=offset)
+            linkedit = find_load_command(signed, current_slice, 0x19, b'__LINKEDIT')
+            text_segment = find_load_command(signed, current_slice, 0x19, b'__TEXT')
+            patch = self.spec.patches[index]
+            mutations = {
+                'code': offset + patch.file_offset - slice_spec.offset + 0x20,
+                'LINKEDIT address': linkedit + 24,
+                'LINKEDIT permissions': linkedit + 56,
+                'TEXT mapping size': text_segment + 32,
+            }
+            for name, position in mutations.items():
+                with self.subTest(architecture=patch.architecture, field=name):
+                    data = bytearray(signed)
+                    data[position] ^= 1
+                    self.write(data)
+                    with self.assertRaisesRegex(PatchError, 'outside the approved signature metadata'):
+                        inspect_app(self.app, self.spec)
+
     def test_original_and_signed_patched_fixtures_are_distinguished(self):
         self.assertEqual(inspect_app(self.app, self.spec), AppState.ORIGINAL)
         self.write(self.signed_patch())
@@ -846,6 +898,20 @@ class CommandTests(TargetFixture, unittest.TestCase):
         self.assertEqual(inspect_app(self.app, self.spec), AppState.PATCHED)
         self.assertEqual((self.backup / 'Contents/MacOS/KakaoTalk').read_bytes(), self.original)
         self.assertEqual(resign.call_args.args[1], self.ENTITLEMENTS)
+
+    def test_apply_accepts_resized_linkedit_mapping_and_restore_recovers_original(self):
+        signed = self.resized_linkedit_signed_patch(repack=True)
+        with mock.patch('patch_kakaotalk.extract_entitlements', return_value=self.ENTITLEMENTS), \
+                mock.patch('patch_kakaotalk.resign_app', side_effect=lambda *args, **kwargs: self.write(signed)):
+            result, output, error = self.invoke('apply')
+        self.assertEqual((result, error), (0, ''))
+        self.assertIn('PATCHED', output)
+        self.assertEqual(self.binary.read_bytes(), signed)
+        self.assertEqual((self.backup / 'Contents/MacOS/KakaoTalk').read_bytes(), self.original)
+        result, output, error = self.invoke('restore')
+        self.assertEqual((result, error), (0, ''))
+        self.assertIn('ORIGINAL', output)
+        self.assertEqual(self.binary.read_bytes(), self.original)
 
     def test_signed_patched_apply_does_not_rewrite_or_resign(self):
         self.make_patched_backup()
